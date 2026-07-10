@@ -99,6 +99,15 @@ function signalLabel(sig) {
   return (sig || "hold").replace("_", " ").replace(/\b\w/g, c => c.toUpperCase());
 }
 
+// Escapes text for safe interpolation into innerHTML. Needed because quote
+// names, search results, and symbols ultimately come from an external API or
+// user input and get inserted into the DOM as markup, not just text.
+function esc(str) {
+  const div = document.createElement("div");
+  div.textContent = str ?? "";
+  return div.innerHTML;
+}
+
 // ============================================================================
 // View: Dashboard
 // ============================================================================
@@ -120,7 +129,7 @@ function renderDashboard() {
         return `
           <div class="market-card">
             <div class="market-card-header">
-              <span class="market-card-name">${q.name}</span>
+              <span class="market-card-name">${esc(q.name)}</span>
               <span>${q.change_percent >= 0 ? "📈" : "📉"}</span>
             </div>
             <div class="market-card-price">$${formatPrice(q.price)}</div>
@@ -144,10 +153,10 @@ function renderDashboard() {
             : symbols.map(sym => {
               const q = quotes?.[sym];
               return `
-                <div class="watchlist-item" onclick="viewQuote('${sym}')">
+                <div class="watchlist-item" onclick="viewQuote('${esc(sym)}')">
                   <div>
-                    <div class="watchlist-symbol">${q?.symbol || sym}</div>
-                    <div class="watchlist-name">${q?.name || "Loading..."}</div>
+                    <div class="watchlist-symbol">${esc(q?.symbol || sym)}</div>
+                    <div class="watchlist-name">${esc(q?.name || "Loading...")}</div>
                   </div>
                   <div class="watchlist-price">
                     <div class="watchlist-price-amount">$${formatPrice(q?.price)}</div>
@@ -170,13 +179,13 @@ function renderDashboard() {
             : signals.slice(0, 10).map(s => `
               <div class="ai-signal ${signalClass(s.signal)}">
                 <div class="ai-signal-header">
-                  <span class="ai-symbol">${s.symbol}</span>
+                  <span class="ai-symbol">${esc(s.symbol)}</span>
                   <div>
                     <span class="signal ${"signal-" + signalClass(s.signal)}">${signalLabel(s.signal)}</span>
                     <span class="confidence">${s.confidence}%</span>
                   </div>
                 </div>
-                <div class="ai-reasoning">${s.reasoning}</div>
+                <div class="ai-reasoning">${esc(s.reasoning)}</div>
               </div>
             `).join("")
           }
@@ -213,7 +222,7 @@ async function renderPortfolio() {
   return `
     <div class="section">
       <h1 class="page-title">Portfolio</h1>
-      <p class="page-subtitle">${portfolio.name}</p>
+      <p class="page-subtitle">${esc(portfolio.name)}</p>
     </div>
     
     <div class="section grid-3">
@@ -253,7 +262,7 @@ async function renderPortfolio() {
               <tbody>
                 ${withPnL.map(h => `
                   <tr>
-                    <td>${h.symbol}</td>
+                    <td>${esc(h.symbol)}</td>
                     <td style="text-align: right">${h.shares}</td>
                     <td style="text-align: right">$${h.avg_cost.toFixed(2)}</td>
                     <td style="text-align: right">$${h.currentPrice?.toFixed(2)}</td>
@@ -304,8 +313,8 @@ function renderTrading() {
             <div class="card-body" style="padding: 1rem;">
               <div class="flex-between mb-4">
                 <div>
-                  <div class="market-card-price">${symbol}</div>
-                  <div class="market-card-name">${quote?.name || "Loading..."}</div>
+                  <div class="market-card-price">${esc(symbol)}</div>
+                  <div class="market-card-name">${esc(quote?.name || "Loading...")}</div>
                 </div>
                 <div style="text-align: right">
                   <div class="market-card-price">$${formatPrice(quote?.price)}</div>
@@ -365,9 +374,9 @@ async function handleSearch(query) {
   
   const results = await searchSymbols(query);
   const html = results.slice(0, 5).map(r => `
-    <div class="watchlist-item" onclick="selectSymbol('${r.symbol}')" style="cursor: pointer;">
-      <span class="watchlist-symbol">${r.symbol}</span>
-      <span class="watchlist-name">${r.name}</span>
+    <div class="watchlist-item" onclick="selectSymbol('${esc(r.symbol)}')" style="cursor: pointer;">
+      <span class="watchlist-symbol">${esc(r.symbol)}</span>
+      <span class="watchlist-name">${esc(r.name)}</span>
     </div>
   `).join("");
   
@@ -467,13 +476,13 @@ function renderSettings() {
       <div class="card-header">Watchlist</div>
       <div class="card-body" style="padding: 1rem;">
         <div class="form-group mb-4">
-          <input type="text" id="new-symbol" placeholder="Add symbol (e.g., AAPL)" 
-                 onkeydown="if(event.key==='Add')addSymbol()">
+          <input type="text" id="new-symbol" placeholder="Add symbol (e.g., AAPL)"
+                 onkeydown="if(event.key==='Enter')addSymbol()">
           <button class="btn btn-primary mt-4" onclick="addSymbol()">Add Symbol</button>
         </div>
         <div class="tags">
           ${(watchlist?.symbols || []).map(s => `
-            <span class="tag">${s}</span>
+            <span class="tag">${esc(s)}</span>
           `).join("")}
         </div>
       </div>
@@ -498,8 +507,8 @@ function renderSettings() {
         <div>
           ${(alerts || []).map(a => `
             <div style="display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid var(--border);">
-              <span>${a.symbol} ${a.type} ${a.condition} ${a.threshold}</span>
-              <button class="btn btn-secondary" onclick="deleteAlert('${a.id}')">Delete</button>
+              <span>${esc(a.symbol)} ${esc(a.type)} ${esc(a.condition)} ${esc(String(a.threshold))}</span>
+              <button class="btn btn-secondary" onclick="deleteAlert('${esc(a.id)}')">Delete</button>
             </div>
           `).join("")}
         </div>
