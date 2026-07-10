@@ -1,34 +1,30 @@
-import json
 import logging
 import os
 import re
 import secrets
-import sqlite3
 import threading
 import time
-import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime
 from functools import wraps
-from typing import Optional
 
-import yfinance as yf
 from flask import Flask, jsonify, request, send_from_directory, session
 from flask_cors import CORS
+from flask_migrate import Migrate
 from flask_socketio import SocketIO, join_room
 from werkzeug.security import check_password_hash, generate_password_hash
+
+from market import Market
+from models import Alert, Portfolio, Position, User, Watchlist, db
 
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
-@dataclass
-class Config:
-    HOST: str = "0.0.0.0"
-    PORT: int = 3001
-    DATABASE: str = "/tmp/stonk_advisor.db"
-    STARTING_BALANCE: float = 100_000.0
+HOST = "0.0.0.0"
+PORT = 3001
+STARTING_BALANCE = 100_000.0
 
 
 # ============================================================================
@@ -36,7 +32,6 @@ class Config:
 # ============================================================================
 
 app = Flask(__name__)
-config = Config()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("stonk_advisor")
@@ -54,7 +49,20 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
 
-CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", f"http://localhost:{config.PORT}").split(",")]
+_default_sqlite_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "stonk_advisor.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", f"sqlite:///{_default_sqlite_path}")
+if DATABASE_URL.startswith("postgres://"):
+    # Some hosts (e.g. Heroku-style providers) hand out the old "postgres://"
+    # scheme, which SQLAlchemy 1.4+ no longer accepts.
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db.init_app(app)
+migrate = Migrate(app, db)
+
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", f"http://localhost:{PORT}").split(",")]
 CORS(app, supports_credentials=True, origins=CORS_ORIGINS)
 socketio = SocketIO(app, cors_allowed_origins=CORS_ORIGINS)
 
@@ -77,169 +85,12 @@ def login_required(f):
 
 
 # ============================================================================
-# Database
+# AI Signal Service
 # ============================================================================
-
-_local = threading.local()
-
-
-def get_db() -> sqlite3.Connection:
-    """Return a connection unique to the current thread.
-
-    SQLite connections are not safe to share across threads, and this app has
-    both Flask's request-handling threads and a background price-updater
-    thread, so each thread gets and reuses its own connection.
-    """
-    conn = getattr(_local, "conn", None)
-    if conn is None:
-        conn = sqlite3.connect(config.DATABASE)
-        conn.row_factory = sqlite3.Row
-        _local.conn = conn
-    return conn
-
-
-def _ensure_column(conn, table, column, coltype):
-    c = conn.cursor()
-    c.execute(f"PRAGMA table_info({table})")
-    existing = {row["name"] for row in c.fetchall()}
-    if column not in existing:
-        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
-
-
-def init_db():
-    conn = get_db()
-    c = conn.cursor()
-
-    schemas = [
-        """CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY, name TEXT DEFAULT '',
-            risk_tolerance TEXT DEFAULT 'moderate',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""",
-        """CREATE TABLE IF NOT EXISTS portfolios (
-            id TEXT PRIMARY KEY, user_id TEXT, name TEXT,
-            type TEXT DEFAULT 'paper', cash_balance REAL DEFAULT 100000,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""",
-        """CREATE TABLE IF NOT EXISTS positions (
-            id TEXT PRIMARY KEY, portfolio_id TEXT, symbol TEXT,
-            shares REAL, avg_cost REAL, acquired_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""",
-        """CREATE TABLE IF NOT EXISTS watchlists (
-            id TEXT PRIMARY KEY, user_id TEXT UNIQUE, symbols TEXT DEFAULT '[]'
-        )""",
-        """CREATE TABLE IF NOT EXISTS alerts (
-            id TEXT PRIMARY KEY, user_id TEXT, symbol TEXT, type TEXT,
-            condition TEXT, threshold REAL, notify_inapp INTEGER DEFAULT 1,
-            active INTEGER DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""",
-    ]
-
-    for s in schemas:
-        c.execute(s)
-
-    _ensure_column(conn, "users", "email", "TEXT")
-    _ensure_column(conn, "users", "password_hash", "TEXT")
-    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
-
-    conn.commit()
-
-
-def get_watchlist_symbols(user_id: str) -> list:
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT symbols FROM watchlists WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    if not row:
-        return []
-    try:
-        return json.loads(row["symbols"])
-    except (TypeError, ValueError):
-        logger.warning("Corrupt watchlist JSON for user %s", user_id)
-        return []
-
-
-def save_watchlist_symbols(user_id: str, symbols: list):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT id FROM watchlists WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    payload = json.dumps(symbols)
-    if row:
-        c.execute("UPDATE watchlists SET symbols = ? WHERE user_id = ?", (payload, user_id))
-    else:
-        c.execute("INSERT INTO watchlists (id, user_id, symbols) VALUES (?, ?, ?)",
-                  (str(uuid.uuid4()), user_id, payload))
-    conn.commit()
-
-
-def get_all_user_ids_with_watchlists() -> list:
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM watchlists")
-    return [row["user_id"] for row in c.fetchall()]
-
-
-# ============================================================================
-# Data Classes
-# ============================================================================
-
-@dataclass
-class Quote:
-    symbol: str; name: str; price: float; change: float
-    change_percent: float; volume: int; high: float; low: float
-    open: float; previous_close: float
-
-
-# ============================================================================
-# Services
-# ============================================================================
-
-class Market:
-    @staticmethod
-    def get_quote(symbol: str) -> Optional[Quote]:
-        try:
-            ticker = yf.Ticker(symbol)
-            hist = ticker.history(period="1d")
-            if hist.empty:
-                return None
-            latest = hist.iloc[-1]
-            info = ticker.info or {}
-            return Quote(
-                symbol=symbol.upper(),
-                name=info.get("shortName", info.get("longName", symbol)),
-                price=float(latest["Close"]),
-                change=float(latest["Close"] - latest["Open"]),
-                change_percent=float(((latest["Close"] - latest["Open"]) / latest["Open"]) * 100),
-                volume=int(latest["Volume"]),
-                high=float(latest["High"]),
-                low=float(latest["Low"]),
-                open=float(latest["Open"]),
-                previous_close=float(latest["Open"])
-            )
-        except Exception:
-            logger.exception("Failed to fetch quote for %s", symbol)
-            return None
-
-    @staticmethod
-    def get_quotes(symbols: list) -> dict:
-        return {s: q for s in symbols if (q := Market.get_quote(s))}
-
-    @staticmethod
-    def search(query: str) -> list:
-        try:
-            tickers = yf.Tickers(query)
-            return [{"symbol": s, "name": t.info.get("shortName", s)}
-                    for s, t in tickers.tickers.items()
-                    if t.info and t.info.get("shortName")][:10]
-        except Exception:
-            logger.exception("Symbol search failed for query %r", query)
-            return []
-
 
 class AI:
     @staticmethod
-    def signal(quote: Quote) -> dict:
+    def signal(quote) -> dict:
         prices = [quote.previous_close, quote.open, quote.price]
 
         # Simple RSI
@@ -271,45 +122,12 @@ class AI:
         else: sig = "hold"
 
         return {
-            "id": str(uuid.uuid4()),
             "symbol": quote.symbol,
             "signal": sig,
             "confidence": min(95, 50 + abs(score)),
             "reasoning": f"{sig.replace('_', ' ').title()}: {', '.join(reasons[:2])}",
             "quote": asdict(quote)
         }
-
-
-class Portfolio:
-    @staticmethod
-    def get_owned(portfolio_id: str, user_id: str) -> Optional[sqlite3.Row]:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT * FROM portfolios WHERE id = ? AND user_id = ?", (portfolio_id, user_id))
-        return c.fetchone()
-
-    @staticmethod
-    def get_holdings(portfolio_id: str) -> list:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT * FROM positions WHERE portfolio_id = ?", (portfolio_id,))
-        return [dict(r) for r in c.fetchall()]
-
-    @staticmethod
-    def add_position(portfolio_id: str, symbol: str, shares: float, avg_cost: float):
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT * FROM positions WHERE portfolio_id = ? AND symbol = ?", (portfolio_id, symbol))
-        existing = c.fetchone()
-        if existing:
-            new_shares = existing["shares"] + shares
-            new_cost = (existing["shares"] * existing["avg_cost"] + shares * avg_cost) / new_shares
-            c.execute("UPDATE positions SET shares = ?, avg_cost = ? WHERE id = ?",
-                     (new_shares, new_cost, existing["id"]))
-        else:
-            c.execute("INSERT INTO positions (id, portfolio_id, symbol, shares, avg_cost) VALUES (?, ?, ?, ?, ?)",
-                     (str(uuid.uuid4()), portfolio_id, symbol, shares, avg_cost))
-        conn.commit()
 
 
 # ============================================================================
@@ -349,23 +167,19 @@ def register():
     if len(password) < MIN_PASSWORD_LENGTH:
         return jsonify({"error": f"Password must be at least {MIN_PASSWORD_LENGTH} characters"}), 400
 
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT id FROM users WHERE email = ?", (email,))
-    if c.fetchone():
+    if User.query.filter_by(email=email).first():
         return jsonify({"error": "An account with that email already exists"}), 409
 
-    user_id = str(uuid.uuid4())
-    c.execute("INSERT INTO users (id, name, email, password_hash) VALUES (?, ?, ?, ?)",
-              (user_id, email.split("@")[0], email, generate_password_hash(password)))
-    c.execute("INSERT INTO portfolios (id, user_id, name, cash_balance) VALUES (?, ?, ?, ?)",
-              (str(uuid.uuid4()), user_id, "My Portfolio", config.STARTING_BALANCE))
-    c.execute("INSERT INTO watchlists (id, user_id, symbols) VALUES (?, ?, ?)",
-              (str(uuid.uuid4()), user_id, json.dumps(["AAPL", "GOOGL", "MSFT"])))
-    conn.commit()
+    user = User(email=email, name=email.split("@")[0], password_hash=generate_password_hash(password))
+    db.session.add(user)
+    db.session.flush()  # populate user.id for the rows below
 
-    session["user_id"] = user_id
-    return jsonify({"user": {"id": user_id, "email": email}}), 201
+    db.session.add(Portfolio(user_id=user.id, name="My Portfolio", cash_balance=STARTING_BALANCE))
+    db.session.add(Watchlist(user_id=user.id, symbols=["AAPL", "GOOGL", "MSFT"]))
+    db.session.commit()
+
+    session["user_id"] = user.id
+    return jsonify({"user": {"id": user.id, "email": user.email}}), 201
 
 
 @app.route("/api/auth/login", methods=["POST"])
@@ -377,16 +191,12 @@ def login():
     email = (d.get("email") or "").strip().lower()
     password = d.get("password") or ""
 
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT id, email, password_hash FROM users WHERE email = ?", (email,))
-    user = c.fetchone()
-
-    if not user or not user["password_hash"] or not check_password_hash(user["password_hash"], password):
+    user = User.query.filter_by(email=email).first()
+    if not user or not check_password_hash(user.password_hash, password):
         return jsonify({"error": "Invalid email or password"}), 401
 
-    session["user_id"] = user["id"]
-    return jsonify({"user": {"id": user["id"], "email": user["email"]}})
+    session["user_id"] = user.id
+    return jsonify({"user": {"id": user.id, "email": user.email}})
 
 
 @app.route("/api/auth/logout", methods=["POST"])
@@ -399,14 +209,11 @@ def logout():
 def me():
     if "user_id" not in session:
         return jsonify({"error": "Authentication required"}), 401
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT id, email FROM users WHERE id = ?", (session["user_id"],))
-    user = c.fetchone()
+    user = db.session.get(User, session["user_id"])
     if not user:
         session.clear()
         return jsonify({"error": "Authentication required"}), 401
-    return jsonify({"user": dict(user)})
+    return jsonify({"user": {"id": user.id, "email": user.email}})
 
 
 # ============================================================================
@@ -419,22 +226,23 @@ def health(): return jsonify({"status": "ok", "timestamp": datetime.now().isofor
 @app.route("/api/portfolio")
 @login_required
 def get_portfolios():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM portfolios WHERE user_id = ?", (session["user_id"],))
-    return jsonify([dict(r) for r in c.fetchall()])
+    portfolios = Portfolio.query.filter_by(user_id=session["user_id"]).all()
+    return jsonify([p.to_dict() for p in portfolios])
 
 @app.route("/api/portfolio/<pid>/holdings")
 @login_required
 def get_holdings(pid):
-    if not Portfolio.get_owned(pid, session["user_id"]):
+    portfolio = Portfolio.query.filter_by(id=pid, user_id=session["user_id"]).first()
+    if not portfolio:
         return jsonify({"error": "Not found"}), 404
-    return jsonify(Portfolio.get_holdings(pid))
+    positions = Position.query.filter_by(portfolio_id=pid).all()
+    return jsonify([p.to_dict() for p in positions])
 
 @app.route("/api/portfolio/<pid>/holdings", methods=["POST"])
 @login_required
 def add_holding(pid):
-    if not Portfolio.get_owned(pid, session["user_id"]):
+    portfolio = Portfolio.query.filter_by(id=pid, user_id=session["user_id"]).first()
+    if not portfolio:
         return jsonify({"error": "Not found"}), 404
 
     d = request.get_json(silent=True)
@@ -452,7 +260,15 @@ def add_holding(pid):
     if not isinstance(avg_cost, (int, float)) or avg_cost < 0:
         return jsonify({"error": "avg_cost must be a non-negative number"}), 400
 
-    Portfolio.add_position(pid, symbol.upper(), shares, avg_cost)
+    symbol = symbol.upper()
+    existing = Position.query.filter_by(portfolio_id=pid, symbol=symbol).first()
+    if existing:
+        new_shares = existing.shares + shares
+        existing.avg_cost = (existing.shares * existing.avg_cost + shares * avg_cost) / new_shares
+        existing.shares = new_shares
+    else:
+        db.session.add(Position(portfolio_id=pid, symbol=symbol, shares=shares, avg_cost=avg_cost))
+    db.session.commit()
     return jsonify({"success": True})
 
 @app.route("/api/market/quote/<symbol>")
@@ -481,7 +297,8 @@ def search():
 @app.route("/api/watchlist")
 @login_required
 def get_watchlist():
-    return jsonify({"symbols": get_watchlist_symbols(session["user_id"])})
+    wl = Watchlist.query.filter_by(user_id=session["user_id"]).first()
+    return jsonify({"symbols": wl.symbols if wl else []})
 
 @app.route("/api/watchlist", methods=["POST"])
 @login_required
@@ -494,28 +311,30 @@ def update_watchlist():
     if not incoming:
         return jsonify({"error": "No valid symbols provided"}), 400
 
-    existing = get_watchlist_symbols(session["user_id"])
-    merged = sorted(set(existing) | set(incoming))
-    save_watchlist_symbols(session["user_id"], merged)
+    wl = Watchlist.query.filter_by(user_id=session["user_id"]).first()
+    if wl:
+        wl.symbols = sorted(set(wl.symbols) | set(incoming))
+    else:
+        wl = Watchlist(user_id=session["user_id"], symbols=sorted(set(incoming)))
+        db.session.add(wl)
+    db.session.commit()
     return jsonify({"success": True})
 
 @app.route("/api/watchlist/<symbol>", methods=["DELETE"])
 @login_required
 def remove_watchlist(symbol):
-    symbols = get_watchlist_symbols(session["user_id"])
+    wl = Watchlist.query.filter_by(user_id=session["user_id"]).first()
     symbol = symbol.upper()
-    if symbol in symbols:
-        symbols.remove(symbol)
-        save_watchlist_symbols(session["user_id"], symbols)
+    if wl and symbol in wl.symbols:
+        wl.symbols = [s for s in wl.symbols if s != symbol]
+        db.session.commit()
     return jsonify({"success": True})
 
 @app.route("/api/alerts")
 @login_required
 def get_alerts():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM alerts WHERE user_id = ?", (session["user_id"],))
-    return jsonify([dict(r) for r in c.fetchall()])
+    alerts = Alert.query.filter_by(user_id=session["user_id"]).all()
+    return jsonify([a.to_dict() for a in alerts])
 
 @app.route("/api/alerts", methods=["POST"])
 @login_required
@@ -538,29 +357,26 @@ def create_alert():
     if not isinstance(threshold, (int, float)):
         return jsonify({"error": "threshold must be a number"}), 400
 
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""INSERT INTO alerts (id, user_id, symbol, type, condition, threshold, notify_inapp, active)
-               VALUES (?, ?, ?, ?, ?, ?, 1, 1)""",
-             (str(uuid.uuid4()), session["user_id"], symbol.upper(), alert_type,
-              condition, threshold))
-    conn.commit()
+    db.session.add(Alert(
+        user_id=session["user_id"], symbol=symbol.upper(), type=alert_type,
+        condition=condition, threshold=threshold,
+    ))
+    db.session.commit()
     return jsonify({"success": True})
 
 @app.route("/api/alerts/<aid>", methods=["DELETE"])
 @login_required
 def delete_alert(aid):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM alerts WHERE id = ? AND user_id = ?", (aid, session["user_id"]))
-    conn.commit()
+    Alert.query.filter_by(id=aid, user_id=session["user_id"]).delete()
+    db.session.commit()
     return jsonify({"success": True})
 
 @app.route("/api/ai")
 @login_required
 def get_ai_signals():
+    wl = Watchlist.query.filter_by(user_id=session["user_id"]).first()
     signals = []
-    for sym in get_watchlist_symbols(session["user_id"]):
+    for sym in (wl.symbols if wl else []):
         q = Market.get_quote(sym)
         if q:
             signals.append(AI.signal(q))
@@ -593,11 +409,11 @@ def handle_connect():
 def price_updater():
     while True:
         try:
-            for user_id in get_all_user_ids_with_watchlists():
-                symbols = get_watchlist_symbols(user_id)
-                if symbols:
-                    qs = Market.get_quotes(symbols)
-                    socketio.emit("quotes", {k: asdict(v) for k, v in qs.items()}, room=user_id)
+            with app.app_context():
+                for wl in Watchlist.query.all():
+                    if wl.symbols:
+                        qs = Market.get_quotes(wl.symbols)
+                        socketio.emit("quotes", {k: asdict(v) for k, v in qs.items()}, room=wl.user_id)
         except Exception:
             logger.exception("price_updater loop failed")
         time.sleep(15)
@@ -608,6 +424,13 @@ def price_updater():
 # ============================================================================
 
 if __name__ == "__main__":
-    init_db()
+    with app.app_context():
+        if DATABASE_URL.startswith("sqlite:"):
+            # Zero-friction local dev: create tables directly instead of
+            # requiring `flask db upgrade` first.
+            db.create_all()
+        # Real deployments (Postgres, etc.) are expected to run
+        # `flask db upgrade` as part of their deploy step.
+
     threading.Thread(target=price_updater, daemon=True).start()
-    socketio.run(app, host=config.HOST, port=config.PORT, debug=False)
+    socketio.run(app, host=HOST, port=PORT, debug=False)
