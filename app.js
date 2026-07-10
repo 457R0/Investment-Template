@@ -444,13 +444,13 @@ function renderAI() {
           : signals.map(s => `
             <div class="ai-signal ${signalClass(s.signal)}">
               <div class="ai-signal-header">
-                <span class="ai-symbol">${s.symbol}</span>
+                <span class="ai-symbol">${esc(s.symbol)}</span>
                 <div>
                   <span class="signal ${"signal-" + signalClass(s.signal)}">${signalLabel(s.signal)}</span>
                   <span class="confidence">${s.confidence}%</span>
                 </div>
               </div>
-              <div class="ai-reasoning">${s.reasoning}</div>
+              <div class="ai-reasoning">${esc(s.reasoning)}</div>
             </div>
           `).join("")
         }
