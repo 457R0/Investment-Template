@@ -579,6 +579,9 @@ def get_ai_signal(symbol):
 # ============================================================================
 # WebSocket & Scheduler
 # ============================================================================
+# TODO: app.js never loads socket.io-client or calls io(), so this per-user
+# room broadcast has no consumer yet. Wire up a real-time feed in the
+# frontend, or remove this machinery if it's not going to be used.
 
 @socketio.on("connect")
 def handle_connect():
