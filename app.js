@@ -12,6 +12,8 @@ let state = {
   page: "dashboard",
   data: {},
   loading: {},
+  authed: false,
+  user: null,
 };
 
 function setState(updates) {
@@ -32,12 +34,22 @@ async function api(endpoint, options = {}) {
   const url = `${API}${endpoint}`;
   const config = {
     headers: { "Content-Type": "application/json", ...options.headers },
+    credentials: "include",
     ...options,
   };
   if (options.body) config.body = JSON.stringify(options.body);
-  
+
   const res = await fetch(url, config);
-  if (!res.ok) throw new Error(res.statusText);
+  if (res.status === 401) {
+    state.authed = false;
+    state.page = "auth";
+    render();
+    throw new Error("Authentication required");
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.error || res.statusText);
+  }
   return res.json();
 }
 
@@ -106,6 +118,90 @@ function esc(str) {
   const div = document.createElement("div");
   div.textContent = str ?? "";
   return div.innerHTML;
+}
+
+// ============================================================================
+// View: Auth
+// ============================================================================
+
+let authState = { mode: "login", error: "" };
+
+function renderAuth() {
+  const isLogin = authState.mode === "login";
+
+  return `
+    <div class="section" style="max-width: 400px; margin: 4rem auto;">
+      <div class="card">
+        <div class="card-header">${isLogin ? "Log In" : "Create Account"}</div>
+        <div class="card-body" style="padding: 1.5rem;">
+          ${authState.error ? `<div class="empty" style="color: var(--red, #e5484d); margin-bottom: 1rem;">${esc(authState.error)}</div>` : ""}
+          <div class="form-group mb-4">
+            <label>Email</label>
+            <input type="email" id="auth-email" placeholder="you@example.com">
+          </div>
+          <div class="form-group mb-4">
+            <label>Password</label>
+            <input type="password" id="auth-password" placeholder="At least 8 characters" onkeydown="if(event.key==='Enter')submitAuth()">
+          </div>
+          <button class="btn btn-primary" style="width: 100%;" onclick="submitAuth()">
+            ${isLogin ? "Log In" : "Sign Up"}
+          </button>
+          <div class="mt-4" style="text-align: center;">
+            <a href="#" onclick="event.preventDefault(); toggleAuthMode();">
+              ${isLogin ? "Need an account? Sign up" : "Already have an account? Log in"}
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function toggleAuthMode() {
+  authState.mode = authState.mode === "login" ? "register" : "login";
+  authState.error = "";
+  render();
+}
+
+async function submitAuth() {
+  const email = document.getElementById("auth-email").value.trim();
+  const password = document.getElementById("auth-password").value;
+  const endpoint = authState.mode === "login" ? "/auth/login" : "/auth/register";
+
+  try {
+    const res = await fetch(`${API}${endpoint}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ email, password }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      authState.error = body.error || "Something went wrong";
+      render();
+      return;
+    }
+    state.authed = true;
+    state.user = body.user;
+    authState.error = "";
+    state.page = "dashboard";
+    await loadData();
+    window.location.hash = "dashboard";
+  } catch (e) {
+    authState.error = "Network error, please try again";
+    render();
+  }
+}
+
+async function logout() {
+  await fetch(`${API}/auth/logout`, { method: "POST", credentials: "include" }).catch(() => {});
+  state.authed = false;
+  state.user = null;
+  state.data = {};
+  state.page = "auth";
+  authState.mode = "login";
+  authState.error = "";
+  render();
 }
 
 // ============================================================================
@@ -367,20 +463,25 @@ function renderTrading() {
 }
 
 async function handleSearch(query) {
+  const resultsEl = document.getElementById("search-results");
+  if (!resultsEl) return;
+
   if (query.length < 1) {
-    document.getElementById("search-results").innerHTML = "";
+    resultsEl.innerHTML = "";
     return;
   }
-  
-  const results = await searchSymbols(query);
+
+  const results = await searchSymbols(query).catch(() => []);
   const html = results.slice(0, 5).map(r => `
     <div class="watchlist-item" onclick="selectSymbol('${esc(r.symbol)}')" style="cursor: pointer;">
       <span class="watchlist-symbol">${esc(r.symbol)}</span>
       <span class="watchlist-name">${esc(r.name)}</span>
     </div>
   `).join("");
-  
-  document.getElementById("search-results").innerHTML = html;
+
+  // The user may have navigated away while this request was in flight.
+  const el = document.getElementById("search-results");
+  if (el) el.innerHTML = html;
 }
 
 async function selectSymbol(symbol) {
@@ -561,20 +662,28 @@ function renderNav() {
     { id: "settings", label: "Settings", icon: "⚙️" },
   ];
   
-  return pages.map(p => `
+  const navHtml = pages.map(p => `
     <a href="#${p.id}" class="${state.page === p.id ? 'active' : ''}">
       <span>${p.icon}</span> ${p.label}
     </a>
   `).join("");
+
+  return `${navHtml}<a href="#" onclick="event.preventDefault(); logout();">${esc(state.user?.email || "")} (Logout)</a>`;
 }
 
 async function render() {
   const nav = document.getElementById("nav");
-  if (nav) nav.innerHTML = renderNav();
-  
   const app = document.getElementById("app");
   if (!app) return;
-  
+
+  if (!state.authed || state.page === "auth") {
+    if (nav) nav.innerHTML = "";
+    app.innerHTML = renderAuth();
+    return;
+  }
+
+  if (nav) nav.innerHTML = renderNav();
+
   switch (state.page) {
     case "dashboard": app.innerHTML = renderDashboard(); break;
     case "portfolio": app.innerHTML = await renderPortfolio(); break;
@@ -583,7 +692,7 @@ async function render() {
     case "settings": app.innerHTML = renderSettings(); break;
     default: app.innerHTML = renderDashboard();
   }
-  
+
   document.getElementById("last-update").textContent = new Date().toLocaleTimeString();
 }
 
@@ -608,16 +717,27 @@ async function loadData() {
 // ============================================================================
 
 document.addEventListener("DOMContentLoaded", async () => {
-  const hash = window.location.hash.slice(1) || "dashboard";
-  state.page = hash;
-  
-  await loadData();
-  
-  // Auto-refresh every 30 seconds
-  setInterval(loadData, 30000);
+  try {
+    const res = await fetch(`${API}/auth/me`, { credentials: "include" });
+    if (res.ok) {
+      const body = await res.json();
+      state.authed = true;
+      state.user = body.user;
+      state.page = window.location.hash.slice(1) || "dashboard";
+      await loadData();
+      setInterval(loadData, 30000);
+      return;
+    }
+  } catch (e) {
+    console.error("Auth check failed:", e);
+  }
+  state.authed = false;
+  state.page = "auth";
+  render();
 });
 
 window.onhashchange = () => {
+  if (!state.authed) return;
   const page = window.location.hash.slice(1) || "dashboard";
   state.page = page;
   render();
@@ -633,3 +753,6 @@ window.addSymbol = addSymbol;
 window.createAlert = createAlert;
 window.deleteAlert = deleteAlert;
 window.loadData = loadData;
+window.submitAuth = submitAuth;
+window.toggleAuthMode = toggleAuthMode;
+window.logout = logout;

@@ -1,18 +1,22 @@
 import json
 import logging
+import os
 import re
+import secrets
+import sqlite3
 import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from functools import wraps
 from typing import Optional
-import sqlite3
 
 import yfinance as yf
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory, session
 from flask_cors import CORS
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, join_room
+from werkzeug.security import check_password_hash, generate_password_hash
 
 
 # ============================================================================
@@ -24,8 +28,6 @@ class Config:
     HOST: str = "0.0.0.0"
     PORT: int = 3001
     DATABASE: str = "/tmp/stonk_advisor.db"
-    DEFAULT_USER: str = "default_user"
-    DEFAULT_PORTFOLIO: str = "default_portfolio"
     STARTING_BALANCE: float = 100_000.0
 
 
@@ -34,18 +36,44 @@ class Config:
 # ============================================================================
 
 app = Flask(__name__)
-CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*")
 config = Config()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("stonk_advisor")
 
+app.secret_key = os.environ.get("SECRET_KEY")
+if not app.secret_key:
+    app.secret_key = secrets.token_hex(32)
+    logger.warning(
+        "SECRET_KEY not set; using a random key for this process only. "
+        "Sessions will not survive a restart and won't work across multiple "
+        "workers. Set the SECRET_KEY environment variable in production."
+    )
+
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
+
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", f"http://localhost:{config.PORT}").split(",")]
+CORS(app, supports_credentials=True, origins=CORS_ORIGINS)
+socketio = SocketIO(app, cors_allowed_origins=CORS_ORIGINS)
+
 SYMBOL_RE = re.compile(r"^[A-Z0-9.\-^]{1,10}$")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MIN_PASSWORD_LENGTH = 8
 
 
 def is_valid_symbol(symbol) -> bool:
     return isinstance(symbol, str) and bool(SYMBOL_RE.match(symbol.upper()))
+
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if "user_id" not in session:
+            return jsonify({"error": "Authentication required"}), 401
+        return f(*args, **kwargs)
+    return wrapper
 
 
 # ============================================================================
@@ -68,6 +96,14 @@ def get_db() -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         _local.conn = conn
     return conn
+
+
+def _ensure_column(conn, table, column, coltype):
+    c = conn.cursor()
+    c.execute(f"PRAGMA table_info({table})")
+    existing = {row["name"] for row in c.fetchall()}
+    if column not in existing:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
 def init_db():
@@ -102,15 +138,9 @@ def init_db():
     for s in schemas:
         c.execute(s)
 
-    c.execute("SELECT id FROM users WHERE id = ?", (config.DEFAULT_USER,))
-    if not c.fetchone():
-        c.execute("INSERT INTO users (id, name) VALUES (?, ?)",
-                  (config.DEFAULT_USER, "Trader"))
-        c.execute("INSERT INTO portfolios (id, user_id, name, cash_balance) VALUES (?, ?, ?, ?)",
-                  (config.DEFAULT_PORTFOLIO, config.DEFAULT_USER, "Paper Trading", config.STARTING_BALANCE))
-        c.execute("INSERT INTO watchlists (id, user_id, symbols) VALUES (?, ?, ?)",
-                  (str(uuid.uuid4()), config.DEFAULT_USER,
-                   json.dumps(["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "NFLX"])))
+    _ensure_column(conn, "users", "email", "TEXT")
+    _ensure_column(conn, "users", "password_hash", "TEXT")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
 
     conn.commit()
 
@@ -141,6 +171,13 @@ def save_watchlist_symbols(user_id: str, symbols: list):
         c.execute("INSERT INTO watchlists (id, user_id, symbols) VALUES (?, ?, ?)",
                   (str(uuid.uuid4()), user_id, payload))
     conn.commit()
+
+
+def get_all_user_ids_with_watchlists() -> list:
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM watchlists")
+    return [row["user_id"] for row in c.fetchall()]
 
 
 # ============================================================================
@@ -245,6 +282,13 @@ class AI:
 
 class Portfolio:
     @staticmethod
+    def get_owned(portfolio_id: str, user_id: str) -> Optional[sqlite3.Row]:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT * FROM portfolios WHERE id = ? AND user_id = ?", (portfolio_id, user_id))
+        return c.fetchone()
+
+    @staticmethod
     def get_holdings(portfolio_id: str) -> list:
         conn = get_db()
         c = conn.cursor()
@@ -269,6 +313,103 @@ class Portfolio:
 
 
 # ============================================================================
+# Static Frontend
+# ============================================================================
+
+STATIC_FILES = {"app.js", "styles.css"}
+
+
+@app.route("/")
+def index():
+    return send_from_directory(app.root_path, "index.html")
+
+
+@app.route("/<path:filename>")
+def static_files(filename):
+    if filename not in STATIC_FILES:
+        return jsonify({"error": "Not found"}), 404
+    return send_from_directory(app.root_path, filename)
+
+
+# ============================================================================
+# Auth Routes
+# ============================================================================
+
+@app.route("/api/auth/register", methods=["POST"])
+def register():
+    d = request.get_json(silent=True)
+    if not isinstance(d, dict):
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    email = (d.get("email") or "").strip().lower()
+    password = d.get("password") or ""
+
+    if not EMAIL_RE.match(email):
+        return jsonify({"error": "Invalid email address"}), 400
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return jsonify({"error": f"Password must be at least {MIN_PASSWORD_LENGTH} characters"}), 400
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id FROM users WHERE email = ?", (email,))
+    if c.fetchone():
+        return jsonify({"error": "An account with that email already exists"}), 409
+
+    user_id = str(uuid.uuid4())
+    c.execute("INSERT INTO users (id, name, email, password_hash) VALUES (?, ?, ?, ?)",
+              (user_id, email.split("@")[0], email, generate_password_hash(password)))
+    c.execute("INSERT INTO portfolios (id, user_id, name, cash_balance) VALUES (?, ?, ?, ?)",
+              (str(uuid.uuid4()), user_id, "My Portfolio", config.STARTING_BALANCE))
+    c.execute("INSERT INTO watchlists (id, user_id, symbols) VALUES (?, ?, ?)",
+              (str(uuid.uuid4()), user_id, json.dumps(["AAPL", "GOOGL", "MSFT"])))
+    conn.commit()
+
+    session["user_id"] = user_id
+    return jsonify({"user": {"id": user_id, "email": email}}), 201
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    d = request.get_json(silent=True)
+    if not isinstance(d, dict):
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    email = (d.get("email") or "").strip().lower()
+    password = d.get("password") or ""
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, email, password_hash FROM users WHERE email = ?", (email,))
+    user = c.fetchone()
+
+    if not user or not user["password_hash"] or not check_password_hash(user["password_hash"], password):
+        return jsonify({"error": "Invalid email or password"}), 401
+
+    session["user_id"] = user["id"]
+    return jsonify({"user": {"id": user["id"], "email": user["email"]}})
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"success": True})
+
+
+@app.route("/api/auth/me")
+def me():
+    if "user_id" not in session:
+        return jsonify({"error": "Authentication required"}), 401
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, email FROM users WHERE id = ?", (session["user_id"],))
+    user = c.fetchone()
+    if not user:
+        session.clear()
+        return jsonify({"error": "Authentication required"}), 401
+    return jsonify({"user": dict(user)})
+
+
+# ============================================================================
 # API Routes
 # ============================================================================
 
@@ -276,17 +417,26 @@ class Portfolio:
 def health(): return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
 
 @app.route("/api/portfolio")
+@login_required
 def get_portfolios():
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM portfolios WHERE user_id = ?", (config.DEFAULT_USER,))
+    c.execute("SELECT * FROM portfolios WHERE user_id = ?", (session["user_id"],))
     return jsonify([dict(r) for r in c.fetchall()])
 
 @app.route("/api/portfolio/<pid>/holdings")
-def get_holdings(pid): return jsonify(Portfolio.get_holdings(pid))
+@login_required
+def get_holdings(pid):
+    if not Portfolio.get_owned(pid, session["user_id"]):
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(Portfolio.get_holdings(pid))
 
 @app.route("/api/portfolio/<pid>/holdings", methods=["POST"])
+@login_required
 def add_holding(pid):
+    if not Portfolio.get_owned(pid, session["user_id"]):
+        return jsonify({"error": "Not found"}), 404
+
     d = request.get_json(silent=True)
     if not isinstance(d, dict):
         return jsonify({"error": "Request body must be JSON"}), 400
@@ -329,10 +479,12 @@ def search():
     return jsonify(Market.search(query))
 
 @app.route("/api/watchlist")
+@login_required
 def get_watchlist():
-    return jsonify({"symbols": get_watchlist_symbols(config.DEFAULT_USER)})
+    return jsonify({"symbols": get_watchlist_symbols(session["user_id"])})
 
 @app.route("/api/watchlist", methods=["POST"])
+@login_required
 def update_watchlist():
     d = request.get_json(silent=True)
     if not isinstance(d, dict) or not isinstance(d.get("symbols"), list):
@@ -342,28 +494,31 @@ def update_watchlist():
     if not incoming:
         return jsonify({"error": "No valid symbols provided"}), 400
 
-    existing = get_watchlist_symbols(config.DEFAULT_USER)
+    existing = get_watchlist_symbols(session["user_id"])
     merged = sorted(set(existing) | set(incoming))
-    save_watchlist_symbols(config.DEFAULT_USER, merged)
+    save_watchlist_symbols(session["user_id"], merged)
     return jsonify({"success": True})
 
 @app.route("/api/watchlist/<symbol>", methods=["DELETE"])
+@login_required
 def remove_watchlist(symbol):
-    symbols = get_watchlist_symbols(config.DEFAULT_USER)
+    symbols = get_watchlist_symbols(session["user_id"])
     symbol = symbol.upper()
     if symbol in symbols:
         symbols.remove(symbol)
-        save_watchlist_symbols(config.DEFAULT_USER, symbols)
+        save_watchlist_symbols(session["user_id"], symbols)
     return jsonify({"success": True})
 
 @app.route("/api/alerts")
+@login_required
 def get_alerts():
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM alerts WHERE user_id = ?", (config.DEFAULT_USER,))
+    c.execute("SELECT * FROM alerts WHERE user_id = ?", (session["user_id"],))
     return jsonify([dict(r) for r in c.fetchall()])
 
 @app.route("/api/alerts", methods=["POST"])
+@login_required
 def create_alert():
     d = request.get_json(silent=True)
     if not isinstance(d, dict):
@@ -387,23 +542,25 @@ def create_alert():
     c = conn.cursor()
     c.execute("""INSERT INTO alerts (id, user_id, symbol, type, condition, threshold, notify_inapp, active)
                VALUES (?, ?, ?, ?, ?, ?, 1, 1)""",
-             (str(uuid.uuid4()), config.DEFAULT_USER, symbol.upper(), alert_type,
+             (str(uuid.uuid4()), session["user_id"], symbol.upper(), alert_type,
               condition, threshold))
     conn.commit()
     return jsonify({"success": True})
 
 @app.route("/api/alerts/<aid>", methods=["DELETE"])
+@login_required
 def delete_alert(aid):
     conn = get_db()
     c = conn.cursor()
-    c.execute("DELETE FROM alerts WHERE id = ? AND user_id = ?", (aid, config.DEFAULT_USER))
+    c.execute("DELETE FROM alerts WHERE id = ? AND user_id = ?", (aid, session["user_id"]))
     conn.commit()
     return jsonify({"success": True})
 
 @app.route("/api/ai")
+@login_required
 def get_ai_signals():
     signals = []
-    for sym in get_watchlist_symbols(config.DEFAULT_USER):
+    for sym in get_watchlist_symbols(session["user_id"]):
         q = Market.get_quote(sym)
         if q:
             signals.append(AI.signal(q))
@@ -423,13 +580,21 @@ def get_ai_signal(symbol):
 # WebSocket & Scheduler
 # ============================================================================
 
+@socketio.on("connect")
+def handle_connect():
+    if "user_id" not in session:
+        return False  # reject the connection
+    join_room(session["user_id"])
+
+
 def price_updater():
     while True:
         try:
-            symbols = get_watchlist_symbols(config.DEFAULT_USER)
-            if symbols:
-                qs = Market.get_quotes(symbols)
-                socketio.emit("quotes", {k: asdict(v) for k, v in qs.items()})
+            for user_id in get_all_user_ids_with_watchlists():
+                symbols = get_watchlist_symbols(user_id)
+                if symbols:
+                    qs = Market.get_quotes(symbols)
+                    socketio.emit("quotes", {k: asdict(v) for k, v in qs.items()}, room=user_id)
         except Exception:
             logger.exception("price_updater loop failed")
         time.sleep(15)
